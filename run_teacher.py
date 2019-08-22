@@ -112,7 +112,7 @@ class ImdbProcessor(object):
 
 
 
-def tfrecord_example2feature(examples, label_list, max_seq_length, tokenizer, output_file, n_passes=1):
+def tfrecord_example2feature(examples, label_list, max_seq_length, tokenizer, output_file):
 
     if tf.gfile.Exists(output_file):
         tf.logging.info('File {} exists, skip.'.format(output_file))
@@ -120,9 +120,6 @@ def tfrecord_example2feature(examples, label_list, max_seq_length, tokenizer, ou
     tf.logging.info('Create new tfrecord {}.'.format(output_file))
 
     writer = tf.python_io.TFRecordWriter(output_file)
-
-    if n_passes > 1:
-        examples *= n_passes
 
     for ex_idx, example in enumerate(examples):
         if ex_idx % 10000 == 0:
@@ -202,7 +199,6 @@ def create_model(flags, input_ids, seg_ids, input_mask, labels, n_label, is_trai
     )
 
     output = xlnet_model.get_output()
-    embed_tb = xlnet_model.get_embed_tb()
 
     with tf.variable_scope("model/loss", reuse=tf.AUTO_REUSE):
         if is_training:
@@ -216,9 +212,7 @@ def create_model(flags, input_ids, seg_ids, input_mask, labels, n_label, is_trai
         per_sample_loss = -tf.reduce_sum(one_hot_labels*log_prob, axis=-1)
         loss = tf.reduce_mean(per_sample_loss)
 
-        embed = tf.gather(embed_tb, input_ids)
-
-    return loss, per_sample_loss, log_prob, logit, embed
+    return loss, log_prob, logit
 
 def model_fn_builder(flags):
     
@@ -231,7 +225,7 @@ def model_fn_builder(flags):
 
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-        loss, per_sample_loss, log_prob, logit, embed = create_model(
+        loss, log_prob, logit = create_model(
             flags=flags,
             input_ids=input_ids,
             seg_ids=seg_ids,
@@ -270,7 +264,7 @@ def model_fn_builder(flags):
             pred = tf.argmax(log_prob, axis=-1, output_type=tf.int32)
             output_spec = tf.estimator.EstimatorSpec(
                 mode=mode,
-                predictions={'pred': pred, 'logit': logit, 'embed': embed}
+                predictions={'pred': pred, 'logit': logit}
             )
 
         return output_spec
@@ -382,15 +376,46 @@ def main(FLAG):
         tf.logging.info('***************************')
         tf.logging.info('  Num examples = {}'.format(len(test_examples)))
         tf.logging.info('  Batch size = {}'.format(FLAG.test_batch_size))
-        result = estimator.predict(input_fn=test_input_fn, checkpoint_path=FLAG.ckpt_path)
         tf.gfile.MakeDirs(FLAG.result_dir)
-        res_list = imdbp.get_labels()
+        embed_tb_path = os.path.join(FLAG.result_dir, 'embed_table.npy')
+        if tf.gfile.Exists(embed_tb_path):
+            tf.logging.info('File {} exists, skip.'.format(embed_tb_path))
+        else:
+            tb = estimator.get_variable_value('model/transformer/word_embedding/lookup_table')
+            np.save(embed_tb_path, tb)
+        train_out_path = os.path.join(FLAG.result_dir, 'train_res.tfrecord')
+        valid_out_path = os.path.join(FLAG.result_dir, 'valid_res.tfrecord')
+        if tf.gfile.Exists(train_out_path) and tf.gfile.Exists(valid_out_path):
+            tf.logging.info('File {} and {} exists, skip.'.format(train_out_path, valid_out_path))
+            return
+        train_writer = tf.python_io.TFRecordWriter(train_out_path)
+        valid_writer = tf.python_io.TFRecordWriter(valid_out_path)
+        result = estimator.predict(input_fn=test_input_fn, checkpoint_path=FLAG.ckpt_path)
         for i, pred in enumerate(result):
-            uid = test_examples[i].guid
-            lab = test_examples[i].label
-            res = res_list[int(pred['pred'])]
-            logit = pred['logit'].tolist()
-            embed = pred['embed'].tolist()
-            output = {'label': lab, 'pred': res, 'logit': logit, 'embed': embed}
-            output_path = os.path.join(FLAG.result_dir, '{}.json'.format(uid))
-            json.dump(output, open(output_path, 'r'))
+            if i % 10000 == 0:
+                tf.logging.info('Writting result [{} / {}]'.format(i, len(test_examples)))
+            feature = cutil.convert_single_example(
+                ex_index=10,
+                example=test_examples[i],
+                label_list=label_list,
+                max_seq_length=FLAG.max_seq_length,
+                tokenize_fn=tokenize_fn
+            )
+            def create_int_feature(values):
+                return tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
+            def create_float_feature(values):
+                return tf.train.Feature(float_list=tf.train.FloatList(value=list(values)))
+            features = collections.OrderedDict()
+            features['input_ids'] = create_int_feature(feature.input_ids)
+            features['logit'] = create_float_feature(pred['logit'])
+            if label_list is not None:
+                features['label_ids'] = create_int_feature([feature.label_id])
+            else:
+                features['label_ids'] = create_float_feature([float(feature.label_id)])
+            tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+            if i < len(train_examples):
+                train_writer.write(tf_example.SerializeToString())
+            else:
+                valid_writer.write(tf_example.SerializeToString())
+        train_writer.close()
+        valid_writer.close()
