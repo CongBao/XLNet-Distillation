@@ -17,6 +17,7 @@ import numpy as np
 import tensorflow as tf
 import sentencepiece as spm
 
+import xlnet.xlnet as xln
 import xlnet.classifier_utils as cutil
 import xlnet.model_utils as mutil
 import xlnet.prepro_utils as putil
@@ -28,23 +29,24 @@ import model
 class Flag(object):
 
     def __init__(self):
-        self.data_dir = None
+        self.data_dir = 'imdb/'
         self.output_dir = 'output/'
-        self.ckpt_path = None
+        self.result_dir = 'result/'
+        self.ckpt_path = 'ckpt/xlnet_model.ckpt'
         self.n_label = 2
         self.uncased = False
         self.do_train = True
         self.do_valid = True
         self.do_test = True
-        self.spiece_model_file = None
-        self.model_config_path = None
+        self.spiece_model_file = 'ckpt/spiece.model'
+        self.model_config_path = 'ckpt/xlnet_config.json'
         self.max_seq_length = 256
-        self.n_train_epoch = 10
-        self.train_batch_size = 32
-        self.dev_batch_size = 8
-        self.test_batch_size = 8
+        self.n_train_epoch = 3
+        self.train_batch_size = 16
+        self.dev_batch_size = 16
+        self.test_batch_size = 16
         self.save_summary_steps = 10
-        self.save_checkpoints_steps = 10
+        self.save_checkpoints_steps = 20
         self.keep_checkpoint_max = None
         self.log_step_count_steps = 1
 
@@ -57,7 +59,7 @@ class Flag(object):
         self.init_std = 0.02
         self.clamp_len = -1
 
-        self.warmup_steps = 500
+        self.warmup_steps = 40
         self.learning_rate = 2e-5
         self.decay_method = 'poly'
         self.train_steps = 1000
@@ -165,7 +167,13 @@ def tfrecord_input_fn_builder(input_file, seq_length, batch_size, is_training):
     tf.logging.info('Input tfrecord file {}.'.format(input_file))
 
     def map_fn(record):
-        return tf.parse_single_example(record, name2feat)
+        example = tf.parse_single_example(record, name2feat)
+        for name in list(example.keys()):
+            t = example[name]
+            if t.dtype == tf.int64:
+                t = tf.cast(t, tf.int32)
+            example[name] = t
+        return example 
     
     def input_fn(params):
         d = tf.data.TFRecordDataset(input_file)
@@ -178,11 +186,17 @@ def tfrecord_input_fn_builder(input_file, seq_length, batch_size, is_training):
 
     return input_fn
 
-def create_model(flags, input_ids, seg_ids, input_mask, labels, n_label, is_training):    
+def create_model(flags, input_ids, seg_ids, input_mask, labels, n_label, is_training):
+
+    bs_per_core = tf.shape(input_ids)[0]
+    in_ids = tf.transpose(input_ids, [1, 0])
+    seg_ids = tf.transpose(seg_ids, [1, 0])
+    input_mask = tf.transpose(input_mask, [1, 0])
+    labels = tf.reshape(labels, [bs_per_core])
     
     xlnet_model = model.Teacher(
         flags=flags,
-        input_ids=input_ids,
+        input_ids=in_ids,
         seg_ids=seg_ids,
         input_mask=input_mask
     )
@@ -190,10 +204,11 @@ def create_model(flags, input_ids, seg_ids, input_mask, labels, n_label, is_trai
     output = xlnet_model.get_output()
     embed_tb = xlnet_model.get_embed_tb()
 
-    with tf.variable_scope('loss'):
+    with tf.variable_scope("model/loss", reuse=tf.AUTO_REUSE):
         if is_training:
-            output = tf.nn.dropout(output, rate=0.1)
-        logit = tf.keras.layers.Dense(n_label)(output)
+            output = tf.nn.dropout(output, rate=flags.dropout)
+
+        logit = tf.keras.layers.Dense(n_label, kernel_initializer=xln._get_initializer(flags))(output)
         log_prob = tf.nn.log_softmax(logit, axis=-1)
 
         one_hot_labels = tf.one_hot(labels, depth=n_label, dtype=tf.float32)
@@ -234,7 +249,7 @@ def model_fn_builder(flags):
             tf.logging.info('***************************')
             for var in tf.trainable_variables():
                 tf.logging.info('  name = {0}, shape= {1}'.format(var.name, var.shape))
-            train_op = mutil.get_train_op(flags, loss)
+            train_op, _, _ = mutil.get_train_op(flags, loss)
             output_spec = tf.estimator.EstimatorSpec(
                 mode=mode,
                 loss=loss,
@@ -242,9 +257,10 @@ def model_fn_builder(flags):
             )
         elif mode == tf.estimator.ModeKeys.EVAL:
             pred = tf.argmax(log_prob, axis=-1, output_type=tf.int32)
-            acc = tf.metrics.accuracy(labels=label, predictions=pred)
-            los = tf.metrics.mean(values=per_sample_loss)
-            eval_metric_ops = {'eval_acc': acc, 'eval_loss': los}
+            acc = tf.metrics.accuracy(label, pred)
+            auc = tf.metrics.auc(label, pred)
+            f1s = tf.contrib.metrics.f1_score(label, pred)
+            eval_metric_ops = {'acc': acc, 'auc': auc, 'f1s': f1s}
             output_spec = tf.estimator.EstimatorSpec(
                 mode=mode,
                 loss=loss,
@@ -339,8 +355,8 @@ def main(FLAG):
     )
     warm_config = tf.estimator.WarmStartSettings(
         ckpt_to_initialize_from=FLAG.ckpt_path,
-        vars_to_warm_start='model/*'
-    ) if FLAG.ckpt_path else None
+        vars_to_warm_start='model/transformer/*'
+    ) if FLAG.ckpt_path and FLAG.do_train else None
     estimator = tf.estimator.Estimator(
         model_fn=model_fn,
         config=run_config,
@@ -367,15 +383,14 @@ def main(FLAG):
         tf.logging.info('  Num examples = {}'.format(len(test_examples)))
         tf.logging.info('  Batch size = {}'.format(FLAG.test_batch_size))
         result = estimator.predict(input_fn=test_input_fn, checkpoint_path=FLAG.ckpt_path)
-        output_test_file = os.path.join(FLAG.output_dir, 'test_results.json')
-        with tf.gfile.GFile(output_test_file, 'w') as writer:
-            tf.logging.info('***** Test Results *****')
-            output = {}
-            for i, pred in enumerate(result):
-                uid = test_examples[i].guid
-                lab = int(test_examples[i].label)
-                res = int(pred['pred'])
-                logit = pred['logit'].tolist()
-                embed = pred['embed'].tolist()
-                output[uid] = {'label': lab, 'pred': res, 'logit': logit, 'embed': embed}
-            writer.write(json.dumps(output))
+        tf.gfile.MakeDirs(FLAG.result_dir)
+        res_list = imdbp.get_labels()
+        for i, pred in enumerate(result):
+            uid = test_examples[i].guid
+            lab = test_examples[i].label
+            res = res_list[int(pred['pred'])]
+            logit = pred['logit'].tolist()
+            embed = pred['embed'].tolist()
+            output = {'label': lab, 'pred': res, 'logit': logit, 'embed': embed}
+            output_path = os.path.join(FLAG.result_dir, '{}.json'.format(uid))
+            json.dump(output, open(output_path, 'r'))
