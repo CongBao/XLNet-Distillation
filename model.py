@@ -32,12 +32,18 @@ class Teacher(object):
     def get_output(self):
         return self.model.get_pooled_out(summary_type='last')
 
-    def get_embed_tb(self):
-        return self.model.get_embedding_table()
-
 
 
 class Student(object):
 
-    def __init__(self, config):
-        pass
+    def __init__(self, flags, embed_tb, input_ids):
+        
+        with tf.variable_scope('student'):
+            embed = tf.get_variable('embedding', initializer=embed_tb)
+            inputs = tf.nn.embedding_lookup(embed, input_ids)
+            self.output = tf.keras.layers.Bidirectional(
+                tf.keras.layers.CuDNNLSTM(flags.units)
+            )(inputs)
+
+    def get_output(self):
+        return self.output
